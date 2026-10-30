@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+
+# set shell settings (see https://sipb.mit.edu/doc/safe-shell/)
+set -euv -o pipefail
+
+# Sanity check that the app doesn't link to libunwind, since this seems to
+# cause incompatibility with macOS 10.14.
+BINARY="./build/install/bin/librepcb.app/Contents/MacOS/librepcb"
+if otool -L "$BINARY" | grep -q "libunwind"; then
+  echo "Error: $BINARY links to libunwind" >&2
+  exit 1
+fi
+
+# Merge GUI application and CLI (https://github.com/LibrePCB/LibrePCB/issues/1358)
+cp "./build/install/bin/librepcb-cli.app/Contents/MacOS/librepcb-cli" \
+   "./build/install/bin/librepcb.app/Contents/MacOS/"
+
+# Replace "bin" and "share" directories with the single *.app directory
+cp -r "./build/install/bin/librepcb.app" "./build/install/LibrePCB.app"
+cp -r "./build/install/share" "./build/install/LibrePCB.app/Contents/"
+
+# Fix failure of macdeployqt according to
+# https://github.com/orgs/Homebrew/discussions/2823.
+# Note: The last 3 symlinks are required for QtQuick.
+fix_macdeployqt () {
+  ln -s -f $1 ./lib  # https://github.com/orgs/Homebrew/discussions/2823
+  ln -s -f $1 ../lib
+  rm -rf ../../lib && ln -s -f $1 ../../lib  # Directory already exists.
+  ln -s -f $1 ../../../lib
+}
+
+# Build bundle
+pushd "./build/install/"  # Avoid having path in DMG name
+dylibbundler -ns -od -b \
+  -x LibrePCB.app/Contents/MacOS/librepcb \
+  -x LibrePCB.app/Contents/MacOS/librepcb-cli \
+  -x lib/liblibrepcbslint.dylib \
+  -d LibrePCB.app/Contents/Frameworks/ \
+  -p @executable_path/../Frameworks/ \
+  -s "$QT_ROOT/lib" \
+  -s "$OCC_ROOT/lib"
+if [ "$ARCH" = "arm64" ]
+then
+  # Apple Silicon requires the binary to be signed, but somehow macdeployqt
+  # fails on that so we have to do it manually.
+  fix_macdeployqt "/opt/homebrew/lib"
+  macdeployqt "LibrePCB.app" -always-overwrite \
+    -executable="./LibrePCB.app/Contents/MacOS/librepcb" \
+    -executable="./LibrePCB.app/Contents/MacOS/librepcb-cli" \
+    -executable="./LibrePCB.app/Contents/Frameworks/liblibrepcbslint.dylib"
+  codesign --force --deep -s - ./LibrePCB.app/Contents/MacOS/librepcb
+  codesign --force --deep -s - ./LibrePCB.app/Contents/MacOS/librepcb-cli
+else
+  # On x86_64, directly create the *.dmg with macdeployqt.
+  fix_macdeployqt "/usr/local/lib"
+  # This is so crappy unstable, we have to try it several times :sob:
+  for run in {1..10}; do
+    if [ ! -f ./LibrePCB.dmg ]; then
+      macdeployqt "LibrePCB.app" -dmg -always-overwrite \
+        -executable="./LibrePCB.app/Contents/MacOS/librepcb" \
+        -executable="./LibrePCB.app/Contents/MacOS/librepcb-cli" \
+        -executable="./LibrePCB.app/Contents/Frameworks/liblibrepcbslint.dylib"
+      sleep 5
+    fi
+  done
+
+  # Test if the bundles are working (hopefully catching deployment issues).
+  ./LibrePCB.app/Contents/MacOS/librepcb-cli --version
+  ./LibrePCB.app/Contents/MacOS/librepcb --exit-after-startup
+
+  # Print checksums to allow fully transparent public verification.
+  shasum -a 256 ./LibrePCB.dmg
+
+  # Move to artifacts.
+  mv ./LibrePCB.dmg ../../artifacts/nightly_builds/librepcb-nightly-mac-$ARCH.dmg
+fi
+popd
